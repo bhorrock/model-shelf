@@ -4,6 +4,7 @@ import pytest
 
 from model_shelf.resolver import (
     Config,
+    ModelWeightsMissingError,
     ShelfNotInitializedError,
     StorageNotAvailableError,
     check_storage_available,
@@ -145,6 +146,7 @@ def test_safetensors_shelf_hit(tmp_path: Path):
     target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B"
     target.mkdir(parents=True)
     (target / "config.json").write_text("{}")
+    (target / "model.safetensors").write_bytes(b"weights")
 
     result = resolve_model(cfg, "Qwen/Qwen3-14B")
 
@@ -158,11 +160,151 @@ def test_format_override(tmp_path: Path):
     target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B-GGUF"
     target.mkdir(parents=True)
     (target / "config.json").write_text("{}")
+    (target / "model.safetensors").write_bytes(b"weights")
 
     result = resolve_model(cfg, "Qwen/Qwen3-14B-GGUF", format="safetensors")
 
     assert result.status == "found"
     assert result.format == "safetensors"
+
+
+def test_safetensors_shelf_hit_accepts_ctranslate2_model_bin(tmp_path: Path):
+    cfg = _config(tmp_path)
+    target = cfg.shelf_root / "safetensors" / "Systran" / "faster-distil-whisper-large-v3"
+    target.mkdir(parents=True)
+    (target / "config.json").write_text("{}")
+    (target / "model.bin").write_bytes(b"weights")
+
+    result = resolve_model(cfg, "Systran/faster-distil-whisper-large-v3")
+
+    assert result.status == "found"
+    assert result.path == target
+
+
+def test_safetensors_shelf_hit_accepts_pyannote_layout(tmp_path: Path):
+    cfg = _config(tmp_path)
+    target = cfg.shelf_root / "safetensors" / "pyannote" / "segmentation-3.0"
+    target.mkdir(parents=True)
+    (target / "config.yaml").write_text("model: pyannote")
+    (target / "pytorch_model.bin").write_bytes(b"weights")
+
+    result = resolve_model(cfg, "pyannote/segmentation-3.0")
+
+    assert result.status == "found"
+    assert result.path == target
+
+
+def test_safetensors_metadata_without_weights_is_missing(tmp_path: Path):
+    cfg = _config(tmp_path)
+    target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B"
+    target.mkdir(parents=True)
+    (target / "config.json").write_text("{}")
+
+    result = resolve_model(cfg, "Qwen/Qwen3-14B")
+
+    assert result.status == "missing"
+
+
+def test_safetensors_download_includes_ctranslate2_weights(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    _patch_candidates(monkeypatch, [cfg.shelf_root])
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        target = Path(kwargs["local_dir"])
+        (target / "config.json").write_text("{}")
+        (target / "model.bin").write_bytes(b"weights")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        "model_shelf.resolver.list_repo_files",
+        lambda repo_id: ["config.json", "model.bin", "README.md"],
+    )
+
+    result = resolve_model(cfg, "Systran/faster-distil-whisper-large-v3")
+
+    assert result.status == "downloaded"
+    assert "model.bin" in captured["allow_patterns"]
+    assert "*.bin" not in captured["allow_patterns"]
+
+
+def test_safetensors_download_selects_safetensors_over_bin_twin(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    _patch_candidates(monkeypatch, [cfg.shelf_root])
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        target = Path(kwargs["local_dir"])
+        (target / "config.json").write_text("{}")
+        (target / "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        "model_shelf.resolver.list_repo_files",
+        lambda repo_id: ["config.json", "model.safetensors", "pytorch_model.bin"],
+    )
+
+    result = resolve_model(cfg, "Example/transformers-model")
+
+    assert result.status == "downloaded"
+    assert "*.safetensors" in captured["allow_patterns"]
+    assert "pytorch_model.bin" not in captured["allow_patterns"]
+
+
+def test_safetensors_download_accepts_pyannote_layout(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    _patch_candidates(monkeypatch, [cfg.shelf_root])
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        target = Path(kwargs["local_dir"])
+        (target / "config.yaml").write_text("model: pyannote")
+        (target / "pytorch_model.bin").write_bytes(b"weights")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        "model_shelf.resolver.list_repo_files",
+        lambda repo_id: ["README.md", "config.yaml", "pytorch_model.bin"],
+    )
+
+    result = resolve_model(cfg, "pyannote/segmentation-3.0")
+
+    assert result.status == "downloaded"
+    assert "config.yaml" in captured["allow_patterns"]
+    assert "pytorch_model.bin" in captured["allow_patterns"]
+    assert "*.safetensors" not in captured["allow_patterns"]
+
+
+def test_safetensors_download_without_weights_raises(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    _patch_candidates(monkeypatch, [cfg.shelf_root])
+
+    def fake_snapshot_download(**kwargs):
+        (Path(kwargs["local_dir"]) / "config.json").write_text("{}")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        "model_shelf.resolver.list_repo_files",
+        lambda repo_id: ["config.json", "model.safetensors"],
+    )
+
+    with pytest.raises(ModelWeightsMissingError, match="no-weights.*model weights"):
+        resolve_model(cfg, "Example/no-weights")
+
+
+def test_safetensors_unknown_layout_raises_with_repo_files(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    _patch_candidates(monkeypatch, [cfg.shelf_root])
+    monkeypatch.setattr(
+        "model_shelf.resolver.list_repo_files",
+        lambda repo_id: ["README.md", "weights.ckpt"],
+    )
+
+    with pytest.raises(ModelWeightsMissingError, match=r"no supported.*weights\.ckpt"):
+        resolve_model(cfg, "Example/unknown-layout")
 
 
 # --- storage availability precheck -----------------------------------------
