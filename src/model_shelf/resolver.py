@@ -20,24 +20,49 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
 
 
 SUPPORTED_FORMATS = ("gguf", "mlx", "safetensors")
 
 SHELF_LEAF_NAME = "ModelShelf/models"  # convention used by detect_storage_candidates
 
-# Files we want when downloading a safetensors repo. Skips PyTorch .bin twins,
-# but includes CTranslate2's canonical weight filename.
-SAFETENSORS_ALLOW_PATTERNS = [
-    "*.safetensors",
-    "*.safetensors.index.json",
-    "model.bin",
+# Metadata shared by the supported Hugging Face snapshot layouts.
+SNAPSHOT_METADATA_PATTERNS = [
     "*.json",
     "tokenizer*",
     "*.txt",
     "*.md",
 ]
+
+
+@dataclass(frozen=True)
+class SnapshotLayout:
+    name: str
+    config_file: str
+    weight_patterns: tuple[str, ...]
+
+    @property
+    def allow_patterns(self) -> list[str]:
+        return [self.config_file, *self.weight_patterns, *SNAPSHOT_METADATA_PATTERNS]
+
+
+SAFETENSORS_LAYOUT = SnapshotLayout(
+    name="transformers/safetensors",
+    config_file="config.json",
+    weight_patterns=("*.safetensors", "*.safetensors.index.json"),
+)
+CTRANSLATE2_LAYOUT = SnapshotLayout(
+    name="CTranslate2",
+    config_file="config.json",
+    weight_patterns=("model.bin",),
+)
+PYANNOTE_LAYOUT = SnapshotLayout(
+    name="pyannote.audio",
+    config_file="config.yaml",
+    weight_patterns=("pytorch_model.bin",),
+)
+SNAPSHOT_LAYOUTS = (SAFETENSORS_LAYOUT, CTRANSLATE2_LAYOUT, PYANNOTE_LAYOUT)
 
 
 class StorageNotAvailableError(RuntimeError):
@@ -49,7 +74,7 @@ class ShelfNotInitializedError(StorageNotAvailableError):
 
 
 class ModelWeightsMissingError(RuntimeError):
-    """A downloaded model directory contains metadata but no usable weights."""
+    """A model snapshot has no recognized, complete set of config and weight files."""
 
 
 @dataclass
@@ -184,11 +209,39 @@ def shelf_path_snapshot(shelf_root: Path, repo_id: str, fmt: str) -> Path:
 
 def _looks_like_model_dir(path: Path, fmt: str) -> bool:
     """Return whether a directory contains the minimum artifacts for its format."""
-    if not (path.is_dir() and (path / "config.json").is_file()):
+    if not path.is_dir():
         return False
     if fmt == "safetensors":
-        return any(path.glob("*.safetensors")) or (path / "model.bin").is_file()
-    return True
+        return any(_layout_exists(path, layout) for layout in SNAPSHOT_LAYOUTS)
+    return (path / "config.json").is_file()
+
+
+def _layout_exists(path: Path, layout: SnapshotLayout) -> bool:
+    if not (path / layout.config_file).is_file():
+        return False
+    return any(any(path.glob(pattern)) for pattern in layout.weight_patterns)
+
+
+def _select_snapshot_layout(repo_files: list[str]) -> SnapshotLayout | None:
+    """Choose one complete root-level layout without downloading duplicate weights."""
+    files = set(repo_files)
+    if "config.json" in files and any(
+        "/" not in name and name.endswith(".safetensors") for name in files
+    ):
+        return SAFETENSORS_LAYOUT
+    if {"config.json", "model.bin"} <= files:
+        return CTRANSLATE2_LAYOUT
+    if {"config.yaml", "pytorch_model.bin"} <= files:
+        return PYANNOTE_LAYOUT
+    return None
+
+
+def _repo_file_summary(repo_files: list[str], limit: int = 12) -> str:
+    names = sorted(repo_files)
+    shown = ", ".join(names[:limit]) or "no files"
+    if len(names) > limit:
+        shown += f", ... ({len(names) - limit} more)"
+    return shown
 
 
 def list_shelf_candidates(config: Config) -> list[Path]:
@@ -336,8 +389,18 @@ def _resolve_snapshot(config: Config, repo_id: str, fmt: str) -> ResolveResult:
 
     # Download into the primary shelf at <root>/<fmt>/<publisher>/<repo>/.
     final = shelf_path_snapshot(config.shelf_root, repo_id, fmt)
+    layout = None
+    allow_patterns = None
+    if fmt == "safetensors":
+        repo_files = list_repo_files(repo_id)
+        layout = _select_snapshot_layout(repo_files)
+        if layout is None:
+            raise ModelWeightsMissingError(
+                f"cannot download {repo_id!r}: no supported model layout was found; "
+                f"repository files: {_repo_file_summary(repo_files)}"
+            )
+        allow_patterns = layout.allow_patterns
     final.mkdir(parents=True, exist_ok=True)
-    allow_patterns = SAFETENSORS_ALLOW_PATTERNS if fmt == "safetensors" else None
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(final),
@@ -345,7 +408,11 @@ def _resolve_snapshot(config: Config, repo_id: str, fmt: str) -> ResolveResult:
     )
 
     if not _looks_like_model_dir(final, fmt):
-        expected = "config.json and model weights (*.safetensors or model.bin)"
+        expected = (
+            f"{layout.config_file} and model weights ({', '.join(layout.weight_patterns)})"
+            if layout is not None
+            else "config.json and model weights"
+        )
         raise ModelWeightsMissingError(
             f"downloaded {repo_id!r} into {final}, but it is not a complete "
             f"{fmt} model directory (expected {expected})"
