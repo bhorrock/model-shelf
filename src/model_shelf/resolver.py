@@ -27,10 +27,12 @@ SUPPORTED_FORMATS = ("gguf", "mlx", "safetensors")
 
 SHELF_LEAF_NAME = "ModelShelf/models"  # convention used by detect_storage_candidates
 
-# Files we want when downloading a safetensors repo. Skips .bin twins.
+# Files we want when downloading a safetensors repo. Skips PyTorch .bin twins,
+# but includes CTranslate2's canonical weight filename.
 SAFETENSORS_ALLOW_PATTERNS = [
     "*.safetensors",
     "*.safetensors.index.json",
+    "model.bin",
     "*.json",
     "tokenizer*",
     "*.txt",
@@ -44,6 +46,10 @@ class StorageNotAvailableError(RuntimeError):
 
 class ShelfNotInitializedError(StorageNotAvailableError):
     """shelf_root is set in config but the directory doesn't exist yet."""
+
+
+class ModelWeightsMissingError(RuntimeError):
+    """A downloaded model directory contains metadata but no usable weights."""
 
 
 @dataclass
@@ -176,9 +182,13 @@ def shelf_path_snapshot(shelf_root: Path, repo_id: str, fmt: str) -> Path:
     return shelf_root / fmt / publisher / repo
 
 
-def _looks_like_model_dir(path: Path) -> bool:
-    """Curated shelf hit for directory formats: dir exists with a config.json inside."""
-    return path.is_dir() and (path / "config.json").is_file()
+def _looks_like_model_dir(path: Path, fmt: str) -> bool:
+    """Return whether a directory contains the minimum artifacts for its format."""
+    if not (path.is_dir() and (path / "config.json").is_file()):
+        return False
+    if fmt == "safetensors":
+        return any(path.glob("*.safetensors")) or (path / "model.bin").is_file()
+    return True
 
 
 def list_shelf_candidates(config: Config) -> list[Path]:
@@ -310,7 +320,7 @@ def _resolve_snapshot(config: Config, repo_id: str, fmt: str) -> ResolveResult:
     for parent in list_shelf_candidates(config):
         candidate = shelf_path_snapshot(parent, repo_id, fmt)
         shelf = parent / fmt
-        if _looks_like_model_dir(candidate):
+        if _looks_like_model_dir(candidate, fmt):
             checks.append({"location": "shelf", "root": str(shelf), "result": "hit"})
             return ResolveResult(
                 status="found", source="local_shelf", format=fmt,
@@ -333,6 +343,13 @@ def _resolve_snapshot(config: Config, repo_id: str, fmt: str) -> ResolveResult:
         local_dir=str(final),
         allow_patterns=allow_patterns,
     )
+
+    if not _looks_like_model_dir(final, fmt):
+        expected = "config.json and model weights (*.safetensors or model.bin)"
+        raise ModelWeightsMissingError(
+            f"downloaded {repo_id!r} into {final}, but it is not a complete "
+            f"{fmt} model directory (expected {expected})"
+        )
 
     return ResolveResult(
         status="downloaded", source="huggingface", format=fmt,

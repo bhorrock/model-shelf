@@ -4,6 +4,8 @@ import pytest
 
 from model_shelf.resolver import (
     Config,
+    ModelWeightsMissingError,
+    SAFETENSORS_ALLOW_PATTERNS,
     ShelfNotInitializedError,
     StorageNotAvailableError,
     check_storage_available,
@@ -145,6 +147,7 @@ def test_safetensors_shelf_hit(tmp_path: Path):
     target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B"
     target.mkdir(parents=True)
     (target / "config.json").write_text("{}")
+    (target / "model.safetensors").write_bytes(b"weights")
 
     result = resolve_model(cfg, "Qwen/Qwen3-14B")
 
@@ -158,11 +161,68 @@ def test_format_override(tmp_path: Path):
     target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B-GGUF"
     target.mkdir(parents=True)
     (target / "config.json").write_text("{}")
+    (target / "model.safetensors").write_bytes(b"weights")
 
     result = resolve_model(cfg, "Qwen/Qwen3-14B-GGUF", format="safetensors")
 
     assert result.status == "found"
     assert result.format == "safetensors"
+
+
+def test_safetensors_shelf_hit_accepts_ctranslate2_model_bin(tmp_path: Path):
+    cfg = _config(tmp_path)
+    target = cfg.shelf_root / "safetensors" / "Systran" / "faster-distil-whisper-large-v3"
+    target.mkdir(parents=True)
+    (target / "config.json").write_text("{}")
+    (target / "model.bin").write_bytes(b"weights")
+
+    result = resolve_model(cfg, "Systran/faster-distil-whisper-large-v3")
+
+    assert result.status == "found"
+    assert result.path == target
+
+
+def test_safetensors_metadata_without_weights_is_missing(tmp_path: Path):
+    cfg = _config(tmp_path)
+    target = cfg.shelf_root / "safetensors" / "Qwen" / "Qwen3-14B"
+    target.mkdir(parents=True)
+    (target / "config.json").write_text("{}")
+
+    result = resolve_model(cfg, "Qwen/Qwen3-14B")
+
+    assert result.status == "missing"
+
+
+def test_safetensors_download_includes_ctranslate2_weights(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        target = Path(kwargs["local_dir"])
+        (target / "config.json").write_text("{}")
+        (target / "model.bin").write_bytes(b"weights")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+
+    result = resolve_model(cfg, "Systran/faster-distil-whisper-large-v3")
+
+    assert result.status == "downloaded"
+    assert "model.bin" in captured["allow_patterns"]
+    assert "*.bin" not in captured["allow_patterns"]
+    assert captured["allow_patterns"] == SAFETENSORS_ALLOW_PATTERNS
+
+
+def test_safetensors_download_without_weights_raises(tmp_path: Path, monkeypatch):
+    cfg = _config(tmp_path, allow_downloads=True)
+
+    def fake_snapshot_download(**kwargs):
+        (Path(kwargs["local_dir"]) / "config.json").write_text("{}")
+
+    monkeypatch.setattr("model_shelf.resolver.snapshot_download", fake_snapshot_download)
+
+    with pytest.raises(ModelWeightsMissingError, match="no-weights.*model weights"):
+        resolve_model(cfg, "Example/no-weights")
 
 
 # --- storage availability precheck -----------------------------------------
